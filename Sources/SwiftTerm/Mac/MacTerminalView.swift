@@ -1959,8 +1959,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
+    /// WhisperM8 patch: holding Shift forces local terminal text selection even
+    /// when the running app has enabled mouse reporting. Mirrors xterm.js'
+    /// shouldForceSelection (Shift on non-mac / "most terminals"). Without it a
+    /// streaming TUI like Claude Code — which always enables mouse tracking in
+    /// its fullscreen/attach mode — makes selecting & copying text impossible,
+    /// because every drag is forwarded to the app instead of selecting locally.
+    private func shouldForceLocalSelection(_ event: NSEvent) -> Bool {
+        return event.modifierFlags.contains(.shift)
+    }
+
     public override func mouseDown(with event: NSEvent) {
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() && !shouldForceLocalSelection(event) {
             sharedMouseEvent(with: event)
             return
         }
@@ -2005,7 +2015,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
             return
         }
-        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() {
+        if allowMouseReporting && terminal.mouseMode.sendButtonRelease() && !shouldForceLocalSelection(event) {
             sharedMouseEvent(with: event)
             return
         }
@@ -2022,7 +2032,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let displayBuffer = terminal.displayBuffer
         let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
-        if allowMouseReporting {
+        if allowMouseReporting && !shouldForceLocalSelection(event) {
             if terminal.mouseMode.sendMotionEvent() {
                 let flags = encodeMouseEvent(with: event)
                 let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
