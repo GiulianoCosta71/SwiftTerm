@@ -874,10 +874,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
-            selection.selectNone()
-        }
+        // WhisperM8 patch: do NOT clear the selection on every linefeed. THIS is
+        // the path that made copy-during-streaming impossible — linefeed fires
+        // on every '\n' (Terminal.emitLineFeed), so a streaming TUI like Claude
+        // Code wiped any selection within milliseconds. The selection is stored
+        // in absolute buffer coordinates and stays valid; matches xterm.js,
+        // which never clears the selection on output. Companion to the
+        // feedPrepare patch in AppleTerminalView.
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
