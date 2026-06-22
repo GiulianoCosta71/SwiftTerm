@@ -2175,9 +2175,27 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
         if event.deltaY > 0 {
+            // WhisperM8 patch: a wheel/trackpad scroll-up must engage the same
+            // scroll-lock that scrollbar drags do. Without this, userScrolling
+            // stays false and Terminal.scroll() yanks yDisp back to yBase on
+            // every new output line — so reading older output while a process
+            // streams is impossible. Mirrors xterm.js' isUserScrolling flag.
+            // Only lock when there is scrollback above us; the alternate screen
+            // buffer has none (and WhisperM8 forwards wheel as SGR before this
+            // override runs there anyway).
+            if terminal.displayBuffer.yDisp > 0 {
+                terminal.userScrolling = true
+            }
             scrollUp (lines: velocity)
         } else {
             scrollDown(lines: velocity)
+            // WhisperM8 patch: once we've scrolled back to the bottom, release
+            // the lock so new output sticks to the tail again (xterm.js:
+            // disp + ydisp >= ybase resets isUserScrolling).
+            let db = terminal.displayBuffer
+            if db.yDisp >= db.lines.count - db.rows {
+                terminal.userScrolling = false
+            }
         }
     }
     
