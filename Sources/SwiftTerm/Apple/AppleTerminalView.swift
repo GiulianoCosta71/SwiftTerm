@@ -2127,10 +2127,12 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
-            selection.active = false
-        }
+        // WhisperM8 patch: do NOT drop the selection while output streams.
+        // SelectionService stores it in absolute buffer coordinates, so it
+        // stays valid as new lines arrive — exactly like xterm.js, which never
+        // clears the selection on write(). Upstream cleared it on every feed()
+        // whenever allowMouseReporting was true, which made copy-during-
+        // streaming (e.g. a running Claude Code session) impossible.
         startDisplayUpdates()
     }
     
