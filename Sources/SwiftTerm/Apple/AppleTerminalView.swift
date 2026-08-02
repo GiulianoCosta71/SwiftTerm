@@ -1667,11 +1667,14 @@ extension TerminalView {
         
         if vy >= buffer.yDisp + buffer.rows {
             caretView.removeFromSuperview()
+            caretDbg("remove-offscreen vy=\(vy) cursorHidden=\(terminal.cursorHidden)")
             return
         } else if terminal.cursorHidden == false && caretView.superview != self {
             addSubview(caretView)
+            caretDbg("addSubview cursorShown")
         } else if terminal.cursorHidden == true && caretView.superview == self {
             caretView.removeFromSuperview()
+            caretDbg("remove cursorHidden")
         }
         let doublePosition = buffer.lines [vy].renderMode == .single ? 1.0 : 2.0
         #if os(iOS) || os(visionOS)
@@ -1683,6 +1686,7 @@ extension TerminalView {
         #endif
         caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
         caretView.setText (ch: buffer.lines [vy][buffer.x])
+        caretDbg("pos y=\(Int(caretView.frame.origin.y)) col=\(buffer.x) row=\(buffer.y) hidden=\(terminal.cursorHidden) inTree=\(caretView.superview != nil)")
     }
     
     // Does not use a default argument and merge, because it is called back

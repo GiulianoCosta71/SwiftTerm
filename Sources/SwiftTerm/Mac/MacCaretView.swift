@@ -71,6 +71,7 @@ class CaretView: NSView, CALayerDelegate {
     }
     
     func updateAnimation (to: Bool) {
+        caretDbg("updateAnimation to=\(to)")
         layer?.removeAllAnimations()
         self.layer?.opacity = 1
         if to {
