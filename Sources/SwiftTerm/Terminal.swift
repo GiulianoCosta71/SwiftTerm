@@ -362,14 +362,14 @@ open class Terminal {
     // Whether the terminal is operating in application cursor mode
     public var applicationCursor : Bool = false
 
-    private struct KeyboardModeState {
+    struct KeyboardModeState {
         var flags: KittyKeyboardFlags = []
         var stack: [KittyKeyboardFlags] = []
     }
 
     private static let keyboardModeStackLimit = 16
-    private var keyboardModeNormal = KeyboardModeState()
-    private var keyboardModeAlt = KeyboardModeState()
+    var keyboardModeNormal = KeyboardModeState()
+    var keyboardModeAlt = KeyboardModeState()
 
     public var keyboardEnhancementFlags: KittyKeyboardFlags {
         let mode = isCurrentBufferAlternate ? keyboardModeAlt : keyboardModeNormal
@@ -418,7 +418,7 @@ open class Terminal {
     var gcharset: Int = 0
     var reverseWraparound: Bool = false
     weak var tdel: TerminalDelegate?
-    private var curAttr: Attribute = CharData.defaultAttr
+    var curAttr: Attribute = CharData.defaultAttr
     private var charToIndexMap: [Character:Int32] = [:]
     private var indexToCharMap: [Int32: Character] = [:]
     private var lastCharIndex: Int32 = Int32(CharData.maxRune + 1)
@@ -503,7 +503,7 @@ open class Terminal {
     }
     
     // The protocol encoding for the terminal
-    private var mouseProtocol: MouseProtocolEncoding = .x10
+    var mouseProtocol: MouseProtocolEncoding = .x10
 
     // This is used to track if we are setting the colors, to prevent a
     // recursive invocation (nativeForegroundColor sets the terminal
@@ -1117,7 +1117,7 @@ open class Terminal {
     // Additionally, the terminal parser needs to reset the parser state on demand, and
     // that is surfaced via reset
     //
-    private struct ReadingBuffer {
+    struct ReadingBuffer {
         var putbackBuffer: [UInt8] = []
         var rest:ArraySlice<UInt8> = [][...]
         var idx = 0
@@ -1182,7 +1182,7 @@ open class Terminal {
         }
     }
     
-    private var readingBuffer = ReadingBuffer ()
+    var readingBuffer = ReadingBuffer ()
     
     func printStateReset ()
     {
@@ -5019,7 +5019,25 @@ open class Terminal {
      */
     public func parse (buffer: ArraySlice<UInt8>)
     {
+        recordRecentInput(buffer)
         parser.parse(data: buffer)
+    }
+
+    /// The most recent input, so `serializeScreen` can hand on a sequence that
+    /// was cut in the middle. Bounded; trimmed in large steps to keep the
+    /// per-feed cost at a copy of the incoming bytes.
+    var recentInput: [UInt8] = []
+    static let recentInputLimit = 32 * 1024
+
+    private func recordRecentInput(_ data: ArraySlice<UInt8>) {
+        if data.count >= Terminal.recentInputLimit {
+            recentInput = Array(data.suffix(Terminal.recentInputLimit))
+            return
+        }
+        recentInput.append(contentsOf: data)
+        if recentInput.count > 2 * Terminal.recentInputLimit {
+            recentInput.removeFirst(recentInput.count - Terminal.recentInputLimit)
+        }
     }
      
     /**
