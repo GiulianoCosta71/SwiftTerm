@@ -102,6 +102,16 @@ public class PseudoTerminalHelpers {
             if let cCurrentDirectory {
                 _ = chdir(cCurrentDirectory)
             }
+            // Keep nothing but the terminal: descriptors the host opened without
+            // close-on-exec (by other libraries, or received from another
+            // process) must not reach the child. Only async-signal-safe calls
+            // here, the host may be multithreaded.
+            let maxDescriptor = min(Int32(getdtablesize()), 65_536)
+            var fd: Int32 = 3
+            while fd < maxDescriptor {
+                _ = close(fd)
+                fd += 1
+            }
             
             _ = execve(cExecutable, cArgs.base, cEnv.base)
             _exit(127)

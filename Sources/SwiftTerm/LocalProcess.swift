@@ -274,6 +274,10 @@ public class LocalProcess {
             childMonitor = nil
         }
 #endif
+        if cancelProcessMonitor {
+            adoptedMonitor?.cancel()
+            adoptedMonitor = nil
+        }
     }
 
     /* Total number of bytes read */
@@ -328,6 +332,13 @@ public class LocalProcess {
         // 2. backlog under the high-water mark; drainReceivedData re-arms
         //    otherwise.
         var keepReading = true
+        pendingLock.lock()
+        let collecting = isDetaching
+        if collecting { detachedBytes.append(contentsOf: b) }
+        pendingLock.unlock()
+        if collecting {
+            return
+        }
         if usesMainQueue {
             keepReading = enqueueReceivedData(b)
         } else {
@@ -345,12 +356,20 @@ public class LocalProcess {
 #if os(macOS)
     var childMonitor: DispatchSourceProcess?
 #endif
+    /// Exit watcher for adopted processes (kqueue with NOTE_EXITSTATUS).
+    var adoptedMonitor: DispatchSourceRead?
+
+    // Hand-over state, guarded by `pendingLock`.
+    var isDetaching = false
+    var detachedBytes: [UInt8] = []
 
     deinit {
 #if os(macOS)
         childMonitor?.cancel()
         childMonitor = nil
 #endif
+        adoptedMonitor?.cancel()
+        adoptedMonitor = nil
         // With [weak self] in the read/write handlers, deinit can fire even
         // when the consumer never called terminate() explicitly. Close the
         // DispatchIO so its cleanup handler releases the file descriptor —
@@ -364,9 +383,21 @@ public class LocalProcess {
 
     func processTerminated ()
     {
+        // The wait status, or nil when it cannot be known: the process was
+        // already collected elsewhere or is not our child (adopted).
         var n: Int32 = 0
-        waitpid (shellPid, &n, WNOHANG)
-        delegate?.processTerminated(self, exitCode: n)
+        let collected = waitpid (shellPid, &n, WNOHANG) == shellPid
+        delegate?.processTerminated(self, exitCode: collected ? n : nil)
+        childStopped()
+    }
+
+    /// Exit of an adopted process, reported through kqueue with its status.
+    func adoptedProcessTerminated (status: Int32?)
+    {
+        var n: Int32 = 0
+        // Reap it if it happens to be our child after all.
+        let collected = waitpid (shellPid, &n, WNOHANG) == shellPid
+        delegate?.processTerminated(self, exitCode: collected ? n : status)
         childStopped()
     }
 
@@ -525,20 +556,181 @@ public class LocalProcess {
             running = true
             self.childfd = childfd
             self.shellPid = shellPid
-            // Capture FD value for cleanup handler to close it safely after DispatchIO is done
-            let fdToClose = childfd
-            io = DispatchIO(type: .stream, fileDescriptor: childfd, queue: dispatchQueue, cleanupHandler: { _ in
-                // Close file descriptor after DispatchIO has finished with it
-                // This prevents EV_VANISHED crash by ensuring proper cleanup order
-                close(fdToClose)
-            })
-            guard let io else {
-                return
-            }
-            io.setLimit(lowWater: 1)
-            io.setLimit(highWater: readSize)
-            io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-                self?.childProcessRead(done: done, data: data, errno: errno)
+            startReading(childfd)
+        }
+    }
+
+    /// Reads from `fd` until it closes. The cleanup handler, which closes the
+    /// descriptor, runs on the read queue, so `detachForHandover` can wait for
+    /// it from the delivery queue.
+    private func startReading(_ fd: Int32) {
+        let done = DispatchSemaphore(value: 0)
+        cleanupDone = done
+        // Capture FD value for cleanup handler to close it safely after DispatchIO is done
+        let fdToClose = fd
+        io = DispatchIO(type: .stream, fileDescriptor: fd, queue: readQueue, cleanupHandler: { _ in
+            // Close file descriptor after DispatchIO has finished with it
+            // This prevents EV_VANISHED crash by ensuring proper cleanup order
+            close(fdToClose)
+            done.signal()
+        })
+        guard let io else {
+            return
+        }
+        io.setLimit(lowWater: 1)
+        io.setLimit(highWater: readSize)
+        io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
+            self?.childProcessRead(done: done, data: data, errno: errno)
+        }
+    }
+
+    private var cleanupDone: DispatchSemaphore?
+
+    /// The primary side of the pseudo terminal and the process behind it, as
+    /// handed from one host to the next.
+    public struct HandoverHandle: Equatable, Sendable {
+        /// A duplicate of the primary descriptor, close-on-exec. The receiver owns it.
+        public let fileDescriptor: Int32
+        public let pid: pid_t
+
+        public init(fileDescriptor: Int32, pid: pid_t) {
+            self.fileDescriptor = fileDescriptor
+            self.pid = pid
+        }
+    }
+
+    /**
+     * Stops reading from the child without closing its terminal and without
+     * signalling it, so another host can take it over.
+     *
+     * Everything already read is delivered to the delegate before this returns,
+     * so the delegate's terminal holds exactly the output up to the point where
+     * the receiver starts reading; take the screen (`serializeScreen`) right
+     * after. Afterwards this instance is no longer running and will not report
+     * the process' exit.
+     *
+     * Only supported when the instance delivers on the main queue (the default);
+     * call it on the main queue. Returns nil if nothing runs, or if reading did
+     * not stop within `timeout` (the instance then keeps running as before).
+     */
+    public func detachForHandover(timeout: TimeInterval = 2) -> HandoverHandle? {
+        guard running, usesMainQueue, childfd >= 0, let io, let cleanupDone else {
+            return nil
+        }
+        let copy = fcntl(childfd, F_DUPFD_CLOEXEC, 0)
+        guard copy >= 0 else {
+            return nil
+        }
+        pendingLock.lock()
+        isDetaching = true
+        detachedBytes = []
+        pendingLock.unlock()
+
+        io.close(flags: .stop)
+        guard cleanupDone.wait(timeout: .now() + timeout) == .success else {
+            // Reading did not stop. Keep the copy as the new reading
+            // descriptor so the terminal stays alive, and do not hand over.
+            pendingLock.lock()
+            isDetaching = false
+            let late = detachedBytes
+            detachedBytes = []
+            pendingLock.unlock()
+            if !late.isEmpty { delegate?.dataReceived(slice: late[...]) }
+            childfd = copy
+            startReading(copy)
+            return nil
+        }
+        self.io = nil
+        childfd = -1
+#if os(macOS)
+        childMonitor?.cancel()
+        childMonitor = nil
+#endif
+        adoptedMonitor?.cancel()
+        adoptedMonitor = nil
+        running = false
+
+        // Hand everything that was read on to the delegate, in order: first
+        // what still waits in the delivery queue, then what arrived while
+        // stopping.
+        pendingLock.lock()
+        let queued = Array(pendingChunks.dropFirst(pendingChunkIndex))
+        pendingChunks.removeAll(keepingCapacity: false)
+        pendingChunkIndex = 0
+        pendingBytes = 0
+        readSuspendedForBackpressure = false
+        let late = detachedBytes
+        detachedBytes = []
+        isDetaching = false
+        pendingLock.unlock()
+        for chunk in queued { delegate?.dataReceived(slice: chunk[...]) }
+        if !late.isEmpty { delegate?.dataReceived(slice: late[...]) }
+
+        let handle = HandoverHandle(fileDescriptor: copy, pid: shellPid)
+        shellPid = 0
+        return handle
+    }
+
+    /**
+     * Takes over a pseudo terminal handed over by another host: reads from
+     * `handle.fileDescriptor` (and owns it from now on) and watches
+     * `handle.pid`, which need not be a child of this process. Its exit is
+     * reported with the wait status from the kernel (kqueue NOTE_EXITSTATUS),
+     * or nil if the kernel does not provide it. A process that ended before
+     * the watch was set up is reported right away.
+     */
+    @discardableResult
+    public func adopt(_ handle: HandoverHandle) -> Bool {
+        guard !running, handle.fileDescriptor >= 0, handle.pid > 0 else {
+            return false
+        }
+        _ = fcntl(handle.fileDescriptor, F_SETFD, FD_CLOEXEC)
+        childfd = handle.fileDescriptor
+        shellPid = handle.pid
+        running = true
+        watchAdoptedExit(pid: handle.pid)
+        startReading(handle.fileDescriptor)
+        return true
+    }
+
+    private func watchAdoptedExit(pid: pid_t) {
+        let kq = kqueue()
+        guard kq >= 0 else {
+            reportAdoptedExitIfGone(pid: pid)
+            return
+        }
+        _ = fcntl(kq, F_SETFD, FD_CLOEXEC)
+        // NOTE_EXITSTATUS (0x04000000) asks for the wait status in `data`.
+        let noteExitStatus: UInt32 = 0x0400_0000
+        var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
+                            fflags: UInt32(NOTE_EXIT) | noteExitStatus, data: 0, udata: nil)
+        if kevent(kq, &change, 1, nil, 0, nil) != 0 {
+            // ESRCH: already gone.
+            close(kq)
+            reportAdoptedExitIfGone(pid: pid)
+            return
+        }
+        let source = DispatchSource.makeReadSource(fileDescriptor: kq, queue: dispatchQueue)
+        source.setEventHandler { [weak self] in
+            var event = kevent()
+            var zero = timespec(tv_sec: 0, tv_nsec: 0)
+            guard kevent(kq, nil, 0, &event, 1, &zero) > 0 else { return }
+            let status: Int32? = (event.fflags & noteExitStatus) != 0 ? Int32(truncatingIfNeeded: event.data) : nil
+            guard let self else { return }
+            self.adoptedMonitor?.cancel()
+            self.adoptedMonitor = nil
+            self.adoptedProcessTerminated(status: status)
+        }
+        source.setCancelHandler { close(kq) }
+        adoptedMonitor = source
+        source.resume()
+    }
+
+    private func reportAdoptedExitIfGone(pid: pid_t) {
+        if kill(pid, 0) != 0 && errno == ESRCH {
+            dispatchQueue.async { [weak self] in
+                guard let self, self.running, self.shellPid == pid else { return }
+                self.adoptedProcessTerminated(status: nil)
             }
         }
     }
