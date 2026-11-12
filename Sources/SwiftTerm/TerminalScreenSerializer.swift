@@ -29,8 +29,9 @@ extension Terminal {
     /// carried on as well (see `unfinishedInput`).
     ///
     /// Not covered: images (sixel, kitty graphics), palette changes (OSC 4),
-    /// left/right margins, character set designations, the title stack, and a
-    /// pending wrap at the right edge (the cursor is placed on the last column).
+    /// left/right margins, character set designations and the title stack. A
+    /// hyperlink still open at the end is linked again from the cursor on, not
+    /// from where it started.
     /// Has no view dependency and does not change the terminal.
     public func serializeScreen() -> [UInt8] {
         var out = ScreenStream()
@@ -44,35 +45,44 @@ extension Terminal {
         out.kittyKeyboard(keyboardModeNormal)
 
         if isCurrentBufferAlternate {
-            // Park the normal cursor where it was; 1049h saves it for the
-            // application's own switch back.
-            out.cursor(row: normal.y, col: normal.x, cols: cols)
+            // 1049h stores the normal cursor, pen and modes in the normal
+            // buffer's saved state; recreate exactly that, then switch.
+            out.scrollRegion(of: normal, rows: rows)
+            out.savedState(of: normal, cols: cols)
             out.csi("?1049h")
+            // Lay out the alternate screen with defaults.
+            out.csi("?7h")
+            out.csi("?6l")
+            out.csi("?45l")
+            out.csi("r")
             out.csi("H")
             out.lines(of: altBuffer, terminal: self)
             out.kittyKeyboard(keyboardModeAlt)
         }
 
         let active = buffer
-        // Saved cursor (DECSC) first: positioning it moves the cursor.
-        out.cursor(row: active.savedY, col: active.savedX, cols: cols)
-        out.pen(active.savedAttr)
+        // Scroll region first: it homes the cursor, and origin-relative
+        // positions depend on it.
+        out.scrollRegion(of: active, rows: rows)
+        // The saved cursor (DECSC) with the modes it stores.
+        out.savedState(of: active, cols: cols)
         out.raw("\u{1b}7")
 
-        // Scroll region homes the cursor, so it comes before the final position.
-        if active.scrollTop != 0 || active.scrollBottom != rows - 1 {
-            out.csi("\(active.scrollTop + 1);\(active.scrollBottom + 1)r")
-        }
-        if originMode {
-            out.csi("?6h")
-            out.cursor(row: active.y - active.scrollTop, col: active.x, cols: cols)
+        out.csi(originMode ? "?6h" : "?6l")
+        let row = originMode ? active.y - active.scrollTop : active.y
+        let lineIndex = active.y + active.yBase
+        if wraparound, active.x >= cols, lineIndex < active.lines.count {
+            // Pending wrap: the cursor sits past the last column. Writing the
+            // last cell again puts the terminal into exactly that state.
+            out.cursor(row: row, col: cols - 1, cols: cols)
+            out.rewriteLastCell(of: active.lines[lineIndex], cols: cols, terminal: self)
         } else {
-            out.cursor(row: active.y, col: active.x, cols: cols)
+            out.cursor(row: row, col: active.x, cols: cols)
         }
 
-        if !wraparound { out.csi("?7l") }
+        out.csi(wraparound ? "?7h" : "?7l")
+        out.csi(reverseWraparound ? "?45h" : "?45l")
         if insertMode { out.csi("4h") }
-        if reverseWraparound { out.csi("?45h") }
         if applicationCursor { out.csi("?1h") }
         if applicationKeypad { out.raw("\u{1b}=") }
         if bracketedPasteMode { out.csi("?2004h") }
@@ -94,6 +104,11 @@ extension Terminal {
         out.csi("\(Self.decscusr(options.cursorStyle)) q")
         if cursorHidden { out.csi("?25l") }
         out.pen(curAttr)
+        // A hyperlink opened but not closed yet: open it again, so text that
+        // follows is linked like in the original (from the cursor on).
+        if let open = hyperLinkTracking {
+            out.raw("\u{1b}]8;\(open.payload)\u{1b}\\")
+        }
         out.bytes.append(contentsOf: unfinishedInput())
         return out.bytes
     }
@@ -102,16 +117,21 @@ extension Terminal {
     /// escape sequence the parser is still collecting, and the first bytes of
     /// a UTF-8 character. Feeding them after the state puts the receiver into
     /// the same position, so the next bytes from the application continue
-    /// there. Empty when the parser is at a clean boundary, and when the
-    /// sequence started longer ago than the recorded input reaches back.
+    /// there. Empty at a clean boundary. If a sequence started longer ago than
+    /// the recorded input reaches back, an unknown OSC is opened instead, so
+    /// the rest of the sequence is swallowed up to its terminator rather than
+    /// printed as text.
     func unfinishedInput() -> [UInt8] {
         var tail: [UInt8] = []
         if !readingBuffer.putbackBuffer.isEmpty {
             tail.append(contentsOf: readingBuffer.putbackBuffer)
         }
-        if parser.currentState != .ground,
-           let start = recentInput.lastIndex(of: 0x1b) {
-            tail.append(contentsOf: recentInput[start...])
+        if parser.currentState != .ground {
+            if let start = recentInput.lastIndex(of: 0x1b) {
+                tail.append(contentsOf: recentInput[start...])
+            } else {
+                tail.append(contentsOf: Array("\u{1b}]9999;".utf8))
+            }
         }
         return tail
     }
@@ -139,6 +159,36 @@ private struct ScreenStream {
 
     mutating func cursor(row: Int, col: Int, cols: Int) {
         csi("\(max(row, 0) + 1);\(min(max(col, 0), cols - 1) + 1)H")
+    }
+
+    /// DECSTBM of `buffer`, or the full screen. Homes the cursor.
+    mutating func scrollRegion(of buffer: Buffer, rows: Int) {
+        if buffer.scrollTop != 0 || buffer.scrollBottom != rows - 1 {
+            csi("\(buffer.scrollTop + 1);\(buffer.scrollBottom + 1)r")
+        } else {
+            csi("r")
+        }
+    }
+
+    /// Puts cursor, pen and the modes DECSC stores into the state `buffer`
+    /// keeps as saved, so a following DECSC (ESC 7 or 1049h) stores the same.
+    mutating func savedState(of buffer: Buffer, cols: Int) {
+        csi(buffer.savedOriginMode ? "?6h" : "?6l")
+        let row = buffer.savedOriginMode ? buffer.savedY - buffer.scrollTop : buffer.savedY
+        cursor(row: row, col: buffer.savedX, cols: cols)
+        csi(buffer.savedWraparound ? "?7h" : "?7l")
+        csi(buffer.savedReverseWraparound ? "?45h" : "?45l")
+        pen(buffer.savedAttr)
+    }
+
+    /// Writes the last cell of `line` again with the cursor on the last
+    /// column (for a wide character: on its first half), leaving a pending wrap.
+    mutating func rewriteLastCell(of line: BufferLine, cols: Int, terminal: Terminal) {
+        var col = cols - 1
+        if col > 0, line[col].width == 0, line[col - 1].width == 2 { col -= 1 }
+        if col != cols - 1 { csi("\(col + 1)G") }
+        writeCell(line[col], terminal: terminal)
+        openLink(nil)
     }
 
     /// Selects `attribute` as the current pen (always written, so the result

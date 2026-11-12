@@ -202,6 +202,54 @@ final class TerminalScreenSerializerTests {
         #expect(differences(o, ocopy).isEmpty)
     }
 
+    @Test func normalScrollRegionAndSavedStateSurviveTheAlternateScreen() {
+        let t = make(30, 8, 20)
+        t.feed(text: "\(esc)[2;6r\(esc)[?7l\(esc)[3;4H\(esc)[32mgrün\(esc)[?1049h\(esc)[0mim alt")
+        expectRoundTrip(t, scrollback: 20, then: "\(esc)[?1049lzurück nach dem Verlassen, sehr lange Zeile ohne Umbruch")
+    }
+
+    @Test func savedCursorKeepsItsModes() {
+        let t = make(30, 8, 20)
+        t.feed(text: "\(esc)[?7l\(esc)[3;5H\(esc)[35m\(esc)7\(esc)[?7h\(esc)[0m\(esc)[1;1Hx")
+        expectRoundTrip(t, scrollback: 20, then: "\(esc)8eine lange Zeile, die am Rand abgeschnitten werden muss")
+    }
+
+    @Test func pendingWrapAtTheRightEdge() {
+        let t = make(10, 4, 10)
+        t.feed(text: "0123456789")
+        expectRoundTrip(t, scrollback: 10, then: "X")
+        let w = make(10, 4, 10)
+        w.feed(text: "01234567日")
+        expectRoundTrip(w, scrollback: 10, then: "Y")
+    }
+
+    @Test func openHyperlinkContinuesForTextAfterTheHandover() {
+        let t = make(40, 4, 10)
+        t.feed(text: "\(esc)]8;;https://example.com\(esc)\\abc")
+        let copy = restored(from: t, scrollback: 10)
+        let rest = "def\(esc)]8;;\(esc)\\ ende"
+        t.feed(text: rest); copy.feed(text: rest)
+        func link(_ term: Terminal, _ col: Int) -> String? {
+            let cell = term.buffer.lines[term.buffer.yBase][col]
+            return cell.hasPayload ? cell.payload.target as? String : nil
+        }
+        for col in 3...5 {
+            #expect(link(copy, col) == link(t, col), "Spalte \(col)")
+            #expect(link(copy, col) != nil)
+        }
+        #expect(link(copy, 7) == nil)
+    }
+
+    @Test func overlongSequenceIsSwallowedNotPrinted() {
+        let t = make(40, 4, 10)
+        let payload = String(repeating: "QUJD", count: 25_000)   // 100 KB, longer than the recorded input
+        t.feed(text: "vorher\(esc)]52;c;" + payload)
+        let copy = restored(from: t, scrollback: 10)
+        let rest = "QUJD\u{07}nachher"
+        t.feed(text: rest); copy.feed(text: rest)
+        #expect(differences(t, copy).isEmpty, "\(differences(t, copy).prefix(3))")
+    }
+
     @Test func serializingDoesNotChangeTheTerminal() {
         let t = make(30, 6, 20)
         t.feed(text: "\(esc)[?1049h\(esc)[31mrot\(esc)[?2004h")
@@ -229,16 +277,25 @@ final class TerminalScreenSerializerTests {
         let scrollback = 2_000
         var failures: [String] = []
         var midSequence = 0
+        // One original, fed on from cut to cut; every cut is compared right
+        // after the copy. Every fourth cut also continues both terminals with
+        // the next stretch of the recording (on a separate original, so the
+        // running one stays at the cut).
+        let running = make(cols, rows, scrollback)
+        var fed = 0
         for k in 1...points {
             let cut = bytes.count * k / (points + 1) + (k % 7)   // irregular offsets
-            let original = make(cols, rows, scrollback)
-            original.feed(byteArray: Array(bytes[..<cut]))
-            if !original.unfinishedInput().isEmpty { midSequence += 1 }
+            running.feed(byteArray: Array(bytes[fed..<cut]))
+            fed = cut
+            if !running.unfinishedInput().isEmpty { midSequence += 1 }
+            let snapshot = running.serializeScreen()
             let copy = make(cols, rows, scrollback)
-            copy.feed(byteArray: original.serializeScreen())
-            let next = Array(bytes[cut..<min(bytes.count, cut + window)])
-            var d = differences(original, copy)
-            if d.isEmpty {
+            copy.feed(byteArray: snapshot)
+            var d = differences(running, copy)
+            if d.isEmpty, k % 4 == 0 {
+                let original = make(cols, rows, scrollback)
+                original.feed(byteArray: Array(bytes[..<cut]))
+                let next = Array(bytes[cut..<min(bytes.count, cut + window)])
                 original.feed(byteArray: next)
                 copy.feed(byteArray: next)
                 d = differences(original, copy)

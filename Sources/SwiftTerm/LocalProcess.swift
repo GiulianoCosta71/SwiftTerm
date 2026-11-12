@@ -155,9 +155,28 @@ public class LocalProcess {
     // Re-arm the PTY read loop after a backpressure pause.
     private func resumePtyRead() {
         guard running, let io else { return }
-        io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-            self?.childProcessRead(done: done, data: data, errno: errno)
+        issueRead(on: io)
+    }
+
+    /// Starts one read on `channel`. Its handler re-arms only on the same,
+    /// still current channel, so a stopped channel never starts a second
+    /// read chain on a newer one.
+    private func issueRead(on channel: DispatchIO) {
+        pendingLock.lock()
+        readInFlight = true
+        pendingLock.unlock()
+        channel.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
+            self?.childProcessRead(channel: channel, done: done, data: data, errno: errno)
         }
+    }
+
+    /// Marks the end of a read operation; wakes a waiting `detachForHandover`.
+    private func readFinished() {
+        pendingLock.lock()
+        readInFlight = false
+        let waiter = isDetaching ? readStopped : nil
+        pendingLock.unlock()
+        waiter?.signal()
     }
 
     private func drainReceivedData() {
@@ -282,13 +301,16 @@ public class LocalProcess {
 
     /* Total number of bytes read */
     var totalRead = 0
-    func childProcessRead (done: Bool, data: DispatchData?, errno: Int32) {
+    func childProcessRead (channel: DispatchIO, done: Bool, data: DispatchData?, errno: Int32) {
+        pendingLock.lock()
+        let isCurrent = channel === io && !isDetaching
+        pendingLock.unlock()
         guard let data else {
             // Re-schedule the read on transient errors to keep the chain alive
-            if !done, running {
-                io?.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-                    self?.childProcessRead(done: done, data: data, errno: errno)
-                }
+            if !done, running, isCurrent {
+                issueRead(on: channel)
+            } else if done {
+                readFinished()
             }
             return
         }
@@ -298,6 +320,8 @@ public class LocalProcess {
         }
         
         if data.count == 0 {
+            if done { readFinished() }
+            guard isCurrent else { return }
             childfd = -1
             if running {
                 // Keep process monitor alive so the exit event can still deliver
@@ -337,6 +361,7 @@ public class LocalProcess {
         if collecting { detachedBytes.append(contentsOf: b) }
         pendingLock.unlock()
         if collecting {
+            if done { readFinished() }
             return
         }
         if usesMainQueue {
@@ -346,9 +371,11 @@ public class LocalProcess {
                 self.delegate?.dataReceived(slice: b[...])
             }
         }
-        if done && keepReading {
-            io?.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-                self?.childProcessRead(done: done, data: data, errno: errno)
+        if done {
+            if keepReading && isCurrent {
+                issueRead(on: channel)
+            } else {
+                readFinished()
             }
         }
     }
@@ -362,6 +389,9 @@ public class LocalProcess {
     // Hand-over state, guarded by `pendingLock`.
     var isDetaching = false
     var detachedBytes: [UInt8] = []
+    /// A read operation is outstanding on the current channel.
+    var readInFlight = false
+    var readStopped: DispatchSemaphore?
     var adoptedExitReported = false
 
     deinit {
@@ -471,9 +501,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
-            io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-                self?.childProcessRead(done: done, data: data, errno: errno)
-            }
+            issueRead(on: io)
 
             // Start subprocess with swift-subprocess asynchronously
             Task {
@@ -564,31 +592,24 @@ public class LocalProcess {
         }
     }
 
-    /// Reads from `fd` until it closes. The cleanup handler, which closes the
-    /// descriptor, runs on the read queue, so `detachForHandover` can wait for
-    /// it from the delivery queue.
+    /// Reads from `fd` until it closes. The cleanup handler closes the
+    /// descriptor once DispatchIO is done with it, also after a handover
+    /// (possibly later, if a write to the old descriptor is still pending).
     private func startReading(_ fd: Int32) {
-        let done = DispatchSemaphore(value: 0)
-        cleanupDone = done
         // Capture FD value for cleanup handler to close it safely after DispatchIO is done
         let fdToClose = fd
-        io = DispatchIO(type: .stream, fileDescriptor: fd, queue: readQueue, cleanupHandler: { _ in
+        let channel = DispatchIO(type: .stream, fileDescriptor: fd, queue: readQueue, cleanupHandler: { _ in
             // Close file descriptor after DispatchIO has finished with it
             // This prevents EV_VANISHED crash by ensuring proper cleanup order
             close(fdToClose)
-            done.signal()
         })
-        guard let io else {
-            return
-        }
-        io.setLimit(lowWater: 1)
-        io.setLimit(highWater: readSize)
-        io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-            self?.childProcessRead(done: done, data: data, errno: errno)
-        }
+        pendingLock.lock()
+        io = channel
+        pendingLock.unlock()
+        channel.setLimit(lowWater: 1)
+        channel.setLimit(highWater: readSize)
+        issueRead(on: channel)
     }
-
-    private var cleanupDone: DispatchSemaphore?
 
     /// The primary side of the pseudo terminal and the process behind it, as
     /// handed from one host to the next.
@@ -618,33 +639,47 @@ public class LocalProcess {
      * not stop within `timeout` (the instance then keeps running as before).
      */
     public func detachForHandover(timeout: TimeInterval = 2) -> HandoverHandle? {
-        guard running, usesMainQueue, childfd >= 0, let io, let cleanupDone else {
+        guard running, usesMainQueue, childfd >= 0, let channel = io else {
             return nil
         }
         let copy = fcntl(childfd, F_DUPFD_CLOEXEC, 0)
         guard copy >= 0 else {
             return nil
         }
+        let stopped = DispatchSemaphore(value: 0)
         pendingLock.lock()
         isDetaching = true
         detachedBytes = []
+        readStopped = stopped
+        let mustWait = readInFlight
         pendingLock.unlock()
 
-        io.close(flags: .stop)
-        guard cleanupDone.wait(timeout: .now() + timeout) == .success else {
-            // Reading did not stop. Keep the copy as the new reading
-            // descriptor so the terminal stays alive, and do not hand over.
-            pendingLock.lock()
-            isDetaching = false
-            let late = detachedBytes
-            detachedBytes = []
-            pendingLock.unlock()
-            if !late.isEmpty { delegate?.dataReceived(slice: late[...]) }
+        // Stop reading. Wait only for the outstanding read to come back, not
+        // for DispatchIO's cleanup: that also waits for writes to the same
+        // descriptor, which hang while the child does not read its input.
+        channel.close(flags: .stop)
+        let finished = !mustWait || stopped.wait(timeout: .now() + timeout) == .success
+
+        pendingLock.lock()
+        isDetaching = false
+        readStopped = nil
+        let late = detachedBytes
+        detachedBytes = []
+        pendingLock.unlock()
+
+        guard finished else {
+            // The read did not come back in time. Keep the terminal alive on
+            // the copy and hand nothing over; bytes that arrived meanwhile go
+            // behind what is already queued, in order.
             childfd = copy
+            if !late.isEmpty { _ = enqueueReceivedData(late) }
             startReading(copy)
             return nil
         }
-        self.io = nil
+
+        pendingLock.lock()
+        io = nil
+        pendingLock.unlock()
         childfd = -1
 #if os(macOS)
         childMonitor?.cancel()
@@ -663,9 +698,6 @@ public class LocalProcess {
         pendingChunkIndex = 0
         pendingBytes = 0
         readSuspendedForBackpressure = false
-        let late = detachedBytes
-        detachedBytes = []
-        isDetaching = false
         pendingLock.unlock()
         for chunk in queued { delegate?.dataReceived(slice: chunk[...]) }
         if !late.isEmpty { delegate?.dataReceived(slice: late[...]) }
@@ -710,9 +742,13 @@ public class LocalProcess {
         var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
                             fflags: UInt32(NOTE_EXIT) | noteExitStatus, data: 0, udata: nil)
         if kevent(kq, &change, 1, nil, 0, nil) != 0 {
-            // ESRCH: already gone.
+            // ESRCH: no such process, or a zombie waiting to be collected
+            // (kill(pid, 0) still succeeds for a zombie). Either way it ended.
             close(kq)
-            reportAdoptedExitIfGone(pid: pid)
+            dispatchQueue.async { [weak self] in
+                guard let self, self.shellPid == pid else { return }
+                self.adoptedProcessTerminated(status: nil)
+            }
             return
         }
         let source = DispatchSource.makeReadSource(fileDescriptor: kq, queue: dispatchQueue)

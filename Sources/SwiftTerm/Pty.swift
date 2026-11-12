@@ -93,6 +93,12 @@ public class PseudoTerminalHelpers {
         }
 
         var master: Int32 = 0
+
+        // Descriptors to close in the child, collected here because the child
+        // may only make async-signal-safe calls. Listing the open ones is far
+        // cheaper than closing every possible number (tens of thousands).
+        let inherited = openDescriptorsAbove2()
+        defer { inherited.deallocate() }
         
         let pid = forkpty(&master, nil, nil, &desiredWindowSize)
         if pid < 0 {
@@ -106,11 +112,19 @@ public class PseudoTerminalHelpers {
             // close-on-exec (by other libraries, or received from another
             // process) must not reach the child. Only async-signal-safe calls
             // here, the host may be multithreaded.
-            let maxDescriptor = min(Int32(getdtablesize()), 65_536)
-            var fd: Int32 = 3
-            while fd < maxDescriptor {
-                _ = close(fd)
-                fd += 1
+            if inherited.count >= 0 {
+                var i = 0
+                while i < inherited.count {
+                    _ = close(inherited.base[i])
+                    i += 1
+                }
+            } else {
+                let maxDescriptor = min(Int32(getdtablesize()), 65_536)
+                var fd: Int32 = 3
+                while fd < maxDescriptor {
+                    _ = close(fd)
+                    fd += 1
+                }
             }
             
             _ = execve(cExecutable, cArgs.base, cEnv.base)
@@ -126,6 +140,40 @@ public class PseudoTerminalHelpers {
         return (pid, master)
     }
     
+    /// Open descriptors of this process from 3 up, in memory the child can
+    /// read without allocating. `count == -1` when the list is unavailable;
+    /// the child then closes every number up to the descriptor limit.
+    struct DescriptorList {
+        let base: UnsafeMutablePointer<Int32>
+        let count: Int
+        func deallocate() { base.deallocate() }
+    }
+
+    static func openDescriptorsAbove2() -> DescriptorList {
+        #if os(macOS)
+        let stride = MemoryLayout<proc_fdinfo>.stride
+        let needed = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, nil, 0)
+        if needed > 0 {
+            // Room for descriptors opened meanwhile.
+            let capacity = Int(needed) / stride + 64
+            let infos = UnsafeMutablePointer<proc_fdinfo>.allocate(capacity: capacity)
+            defer { infos.deallocate() }
+            let got = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, infos, Int32(capacity * stride))
+            if got > 0 {
+                let n = Int(got) / stride
+                let base = UnsafeMutablePointer<Int32>.allocate(capacity: max(n, 1))
+                var count = 0
+                for i in 0..<n where infos[i].proc_fd >= 3 {
+                    base[count] = infos[i].proc_fd
+                    count += 1
+                }
+                return DescriptorList(base: base, count: count)
+            }
+        }
+        #endif
+        return DescriptorList(base: UnsafeMutablePointer<Int32>.allocate(capacity: 1), count: -1)
+    }
+
     /**
      * Sets the window size of the underlying pseudo terminal.
      * - Parameter masterPtyDescriptor: a pseudo-terminal master file descriptor, as returned by fork(andExec:)

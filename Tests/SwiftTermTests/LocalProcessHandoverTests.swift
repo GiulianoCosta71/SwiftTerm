@@ -77,8 +77,10 @@ final class LocalProcessHandoverTests {
         await wait { second.text.contains("got:hallo") }
         #expect(second.text.contains("got:hallo"))
 
-        // Together the two hosts saw every tick exactly once, in order.
-        let all = before + ticks(second.text)
+        // Together the two hosts saw every tick exactly once, in order (parsed
+        // together: the handover may split a line between the hosts).
+        _ = before
+        let all = ticks(first.text + second.text)
         #expect(!all.isEmpty && all == Array(1...max(all.count, 1)), "Lücke oder Doppel: \(all.prefix(20))…")
 
         p2.send(data: Array("quit\n".utf8)[...])
@@ -112,7 +114,7 @@ final class LocalProcessHandoverTests {
         let pidFile = dir.appendingPathComponent("pid").path
         let outer = Recorder()
         let p1 = LocalProcess(delegate: outer)
-        p1.startProcess(executable: "/bin/sh", args: ["-c", "sh -c 'echo $$ > \"\(pidFile)\"; sleep 0.6; exit 5' & sleep 5"])
+        p1.startProcess(executable: "/bin/sh", args: ["-c", "sh -c 'echo $$ > \"\(pidFile)\"; sleep 2; exit 5' & sleep 8"])
         await wait { FileManager.default.fileExists(atPath: pidFile) && ((try? String(contentsOfFile: pidFile, encoding: .utf8)) ?? "").hasSuffix("\n") }
         let grandchild = try #require(Int32(((try? String(contentsOfFile: pidFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)))
         let handle = try #require(p1.detachForHandover())
@@ -139,8 +141,66 @@ final class LocalProcessHandoverTests {
         let p2 = LocalProcess(delegate: second)
         p2.adopt(handle)
         await wait { !second.exits.isEmpty }
+        try await Task.sleep(nanoseconds: 300_000_000)   // a second report would show up here
         #expect(second.exits.count == 1)
         #expect(!p2.running)
+    }
+
+    @Test func outputQueuedForDeliveryIsNotLostOrReordered() async throws {
+        // A fast producer and a busy main thread: at the handover, part of the
+        // output still waits in the delivery queue of the first host.
+        let first = Recorder()
+        let p1 = LocalProcess(delegate: first)
+        p1.startProcess(executable: "/bin/sh", args: ["-c", "seq 1 200000; sleep 5"])
+        await wait { first.bytes.count > 1000 }
+        usleep(300_000)   // main busy, reads pile up in the delivery queue
+        let handle = try #require(p1.detachForHandover())
+        let second = Recorder()
+        let p2 = LocalProcess(delegate: second)
+        p2.adopt(handle)
+        await wait(10) { String(decoding: second.bytes.suffix(16), as: UTF8.self).contains("\n200000") }
+        let numbers = (first.text + second.text).split(whereSeparator: { $0.isNewline }).compactMap { Int($0) }
+        #expect(numbers == Array(1...200000), "Anzahl \(numbers.count), erste Abweichung bei \(zip(numbers, 1...).first(where: { $0 != $1 }).map { "\($0)" } ?? "-")")
+        kill(handle.pid, SIGKILL)
+        waitpid(handle.pid, nil, 0)
+    }
+
+    @Test func pendingWriteToAChildThatDoesNotReadDoesNotBlockTheHandover() async throws {
+        let rec = Recorder()
+        let p1 = LocalProcess(delegate: rec)
+        p1.startProcess(executable: "/bin/sh", args: ["-c", "sleep 30"])
+        try await Task.sleep(nanoseconds: 200_000_000)
+        // More than the terminal's input queue holds: the write stays pending.
+        p1.send(data: [UInt8](repeating: UInt8(ascii: "x"), count: 512 * 1024)[...])
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let start = Date()
+        let handle = p1.detachForHandover(timeout: 2)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(handle != nil)
+        #expect(elapsed < 1, "Abgabe wartete \(elapsed) s auf den hängenden Schreibauftrag")
+        if let handle {
+            close(handle.fileDescriptor)
+            kill(handle.pid, SIGKILL)
+            waitpid(handle.pid, nil, 0)
+        }
+    }
+
+    @Test func adoptingAZombieReportsItsExit() async throws {
+        // After the handover nobody collects the child; it ends and stays a
+        // zombie until the next host adopts it.
+        let first = Recorder()
+        let p1 = LocalProcess(delegate: first)
+        p1.startProcess(executable: "/bin/sh", args: ["-c", "sleep 0.3; exit 4"])
+        let handle = try #require(p1.detachForHandover())
+        try await Task.sleep(nanoseconds: 900_000_000)
+        let second = Recorder()
+        let p2 = LocalProcess(delegate: second)
+        p2.adopt(handle)
+        await wait { !second.exits.isEmpty }
+        #expect(second.exits.count == 1, "Ende eines Zombies nicht gemeldet")
+        if let status = second.exits.first ?? nil {
+            #expect((status >> 8) & 0xff == 4)
+        }
     }
 
     @Test func ownChildStillReportsItsRealStatus() async throws {
