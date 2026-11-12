@@ -106,6 +106,13 @@ public class PseudoTerminalHelpers {
             _ = execve(cExecutable, cArgs.base, cEnv.base)
             _exit(127)
         }
+        // The primary side belongs to this process only. Without close-on-exec every
+        // child started later (another terminal, a helper spawned with fork/exec) would
+        // inherit it, could read and write this terminal, and would keep it open after
+        // this process exits, so the child here would not get SIGHUP. forkpty has no
+        // flag for this; between forkpty and fcntl another thread could still fork,
+        // callers that start terminals from several threads must serialize that.
+        _ = fcntl(master, F_SETFD, FD_CLOEXEC)
         return (pid, master)
     }
     
