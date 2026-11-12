@@ -362,6 +362,7 @@ public class LocalProcess {
     // Hand-over state, guarded by `pendingLock`.
     var isDetaching = false
     var detachedBytes: [UInt8] = []
+    var adoptedExitReported = false
 
     deinit {
 #if os(macOS)
@@ -392,8 +393,11 @@ public class LocalProcess {
     }
 
     /// Exit of an adopted process, reported through kqueue with its status.
+    /// Reported once, also when the terminal reached end-of-file first.
     func adoptedProcessTerminated (status: Int32?)
     {
+        guard !adoptedExitReported else { return }
+        adoptedExitReported = true
         var n: Int32 = 0
         // Reap it if it happens to be our child after all.
         let collected = waitpid (shellPid, &n, WNOHANG) == shellPid
@@ -687,6 +691,7 @@ public class LocalProcess {
         _ = fcntl(handle.fileDescriptor, F_SETFD, FD_CLOEXEC)
         childfd = handle.fileDescriptor
         shellPid = handle.pid
+        adoptedExitReported = false
         running = true
         watchAdoptedExit(pid: handle.pid)
         startReading(handle.fileDescriptor)
@@ -729,7 +734,8 @@ public class LocalProcess {
     private func reportAdoptedExitIfGone(pid: pid_t) {
         if kill(pid, 0) != 0 && errno == ESRCH {
             dispatchQueue.async { [weak self] in
-                guard let self, self.running, self.shellPid == pid else { return }
+                // Not `running`: end-of-file on the terminal may come first.
+                guard let self, self.shellPid == pid else { return }
                 self.adoptedProcessTerminated(status: nil)
             }
         }

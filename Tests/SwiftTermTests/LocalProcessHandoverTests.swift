@@ -32,6 +32,7 @@ final class LocalProcessHandoverTests {
     }
 
     /// Prints numbered ticks, notes SIGHUP in a file, and exits with 7 on "quit".
+    /// zsh, because the system bash 3.2 has no fractional `read -t`.
     private func tickerScript() -> String {
         let hup = dir.appendingPathComponent("hup").path
         return """
@@ -45,7 +46,7 @@ final class LocalProcessHandoverTests {
     }
 
     private func ticks(_ text: String) -> [Int] {
-        text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).compactMap { line in
+        text.split(whereSeparator: { $0.isNewline }).compactMap { line in
             line.hasPrefix("tick ") ? Int(line.dropFirst(5)) : nil
         }
     }
@@ -53,9 +54,10 @@ final class LocalProcessHandoverTests {
     @Test func handoverKeepsTheChildAliveWithoutGapsAndReportsItsExitStatus() async throws {
         let first = Recorder()
         let p1 = LocalProcess(delegate: first)
-        p1.startProcess(executable: "/bin/sh", args: ["-c", tickerScript()])
+        p1.startProcess(executable: "/bin/zsh", args: ["-c", tickerScript()])
         let pid = p1.shellPid
         await wait { ticks(first.text).count >= 5 }
+        try #require(ticks(first.text).count >= 5, "Ticker-Ausgabe: \(first.text.prefix(300).debugDescription)")
 
         let handle = try #require(p1.detachForHandover())
         #expect(handle.pid == pid)
@@ -77,7 +79,7 @@ final class LocalProcessHandoverTests {
 
         // Together the two hosts saw every tick exactly once, in order.
         let all = before + ticks(second.text)
-        #expect(all == Array(1...all.count), "Lücke oder Doppel: \(all.prefix(20))…")
+        #expect(!all.isEmpty && all == Array(1...max(all.count, 1)), "Lücke oder Doppel: \(all.prefix(20))…")
 
         p2.send(data: Array("quit\n".utf8)[...])
         await wait { !second.exits.isEmpty }
@@ -90,7 +92,7 @@ final class LocalProcessHandoverTests {
     @Test func releasingTheFirstHostAfterDetachDoesNotTouchTheChild() async throws {
         let first = Recorder()
         var p1: LocalProcess? = LocalProcess(delegate: first)
-        p1!.startProcess(executable: "/bin/sh", args: ["-c", tickerScript()])
+        p1!.startProcess(executable: "/bin/zsh", args: ["-c", tickerScript()])
         let pid = p1!.shellPid
         await wait { ticks(first.text).count >= 2 }
         let handle = try #require(p1!.detachForHandover())
@@ -98,9 +100,11 @@ final class LocalProcessHandoverTests {
         try await Task.sleep(nanoseconds: 200_000_000)
         #expect(kill(pid, 0) == 0)
         #expect(fcntl(handle.fileDescriptor, F_GETFD) >= 0, "Kopie noch offen")
+        // Close the copy first: a process that exits with unread output on its
+        // terminal waits in exit until someone reads or the last primary closes.
+        close(handle.fileDescriptor)
         kill(pid, SIGKILL)
         waitpid(pid, nil, 0)
-        close(handle.fileDescriptor)
     }
 
     @Test func exitStatusOfAnAdoptedProcessThatIsNotOurChild() async throws {
