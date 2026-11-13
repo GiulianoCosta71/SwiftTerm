@@ -127,13 +127,36 @@ extension Terminal {
             tail.append(contentsOf: readingBuffer.putbackBuffer)
         }
         if parser.currentState != .ground {
-            if let start = recentInput.lastIndex(of: 0x1b) {
+            if let start = Self.unfinishedSequenceStart(in: recentInput) {
                 tail.append(contentsOf: recentInput[start...])
             } else {
                 tail.append(contentsOf: Array("\u{1b}]9999;".utf8))
             }
         }
         return tail
+    }
+
+    /// Where the sequence the parser is still collecting begins: the last ESC,
+    /// except when that ESC is the first half of the string terminator
+    /// (ESC \) of an OSC, DCS, APC, PM or SOS. Then the string itself is
+    /// unfinished and starts at its introducer; taking only the final ESC
+    /// would drop a link or title.
+    static func unfinishedSequenceStart(in input: [UInt8]) -> Int? {
+        guard let last = input.lastIndex(of: 0x1b) else { return nil }
+        guard last == input.count - 1, last > 0 else { return last }
+        // Introducers: ] OSC, P DCS, _ APC, ^ PM, X SOS.
+        let introducers: Set<UInt8> = [0x5d, 0x50, 0x5f, 0x5e, 0x58]
+        var index = last - 1
+        while index >= 0 {
+            let byte = input[index]
+            if byte == 0x07 { return last }   // BEL ended a string before
+            if byte == 0x1b {
+                let next = index + 1 < input.count ? input[index + 1] : 0
+                return introducers.contains(next) ? index : last
+            }
+            index -= 1
+        }
+        return last
     }
 
     static func decscusr(_ style: CursorStyle) -> Int {

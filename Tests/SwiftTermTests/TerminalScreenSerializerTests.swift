@@ -202,6 +202,34 @@ final class TerminalScreenSerializerTests {
         #expect(differences(o, ocopy).isEmpty)
     }
 
+    @Test func cutBetweenTheTwoBytesOfTheStringTerminatorKeepsTheString() {
+        // Review 13.11.2026, Befund 4: the cut falls between ESC and \ of ST.
+        let o = make(40, 6, 10)
+        o.feed(text: "\(esc)]8;;https://example.com\(esc)")
+        let ocopy = restored(from: o, scrollback: 10)
+        o.feed(text: "\\Link\(esc)]8;;\(esc)\\"); ocopy.feed(text: "\\Link\(esc)]8;;\(esc)\\")
+        #expect(differences(o, ocopy).isEmpty)
+        let t = make(40, 6, 10)
+        t.feed(text: "\(esc)]2;Titel\(esc)")
+        let tcopy = restored(from: t, scrollback: 10)
+        t.feed(text: "\\danach"); tcopy.feed(text: "\\danach")
+        #expect(differences(t, tcopy).isEmpty)
+        #expect(tcopy.terminalTitle == "Titel")
+    }
+
+    @Test func unfinishedSequenceStartRules() {
+        let e: UInt8 = 0x1b
+        let osc = [e] + Array("]8;;x".utf8) + [e]
+        #expect(Terminal.unfinishedSequenceStart(in: osc) == 0, "ST angeschnitten: ab ESC ]")
+        let done = [e] + Array("]0;t".utf8) + [e, 0x5c, e]
+        #expect(Terminal.unfinishedSequenceStart(in: done) == done.count - 1, "fertiger String davor: nur das letzte ESC")
+        let bel = [e] + Array("]0;t".utf8) + [0x07, e]
+        #expect(Terminal.unfinishedSequenceStart(in: bel) == bel.count - 1)
+        let csi = [e] + Array("[38;2;1".utf8)
+        #expect(Terminal.unfinishedSequenceStart(in: csi) == 0)
+        #expect(Terminal.unfinishedSequenceStart(in: Array("abc".utf8)) == nil)
+    }
+
     @Test func normalScrollRegionAndSavedStateSurviveTheAlternateScreen() {
         let t = make(30, 8, 20)
         t.feed(text: "\(esc)[2;6r\(esc)[?7l\(esc)[3;4H\(esc)[32mgrün\(esc)[?1049h\(esc)[0mim alt")

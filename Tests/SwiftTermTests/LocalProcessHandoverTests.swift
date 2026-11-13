@@ -212,6 +212,67 @@ final class LocalProcessHandoverTests {
         #expect((status >> 8) & 0xff == 3)
     }
 
+    // Review 13.11.2026, Befund 1: only "no such process" counts as ended.
+    @Test func adoptFailsWhenTheExitCannotBeWatched() throws {
+        // launchd (PID 1) belongs to root: kqueue refuses the watch with a
+        // permission error, not "no such process".
+        var fds: [Int32] = [0, 0]
+        #expect(pipe(&fds) == 0)
+        defer { close(fds[0]); close(fds[1]) }
+        let rec = Recorder()
+        let p = LocalProcess(delegate: rec)
+        #expect(!p.adopt(LocalProcess.HandoverHandle(fileDescriptor: fds[0], pid: 1)))
+        #expect(!p.running)
+        #expect(p.shellPid == 0)
+        #expect(fcntl(fds[0], F_GETFD) >= 0, "der Aufrufer behält die Leitung")
+        #expect(rec.exits.isEmpty, "kein erfundenes Ende")
+    }
+
+    // Review 13.11.2026, Befund 2: after a detach that ran out of time, the
+    // next one must still wait for the outstanding read. Repeated, because a
+    // detach only times out while a read is actually in flight.
+    @Test func detachAfterATimedOutDetachLosesNothing() async throws {
+        let first = Recorder()
+        let p1 = LocalProcess(delegate: first)
+        p1.startProcess(executable: "/bin/sh", args: ["-c", "seq 1 300000; sleep 5"])
+        await wait { first.bytes.count > 1000 }
+        var timedOut = 0
+        var early: LocalProcess.HandoverHandle?
+        for _ in 0..<50 where timedOut < 3 {
+            // Succeeds when no read happens to be in flight; then that handle
+            // is the handover and the check below still applies.
+            if let handle = p1.detachForHandover(timeout: 0) { early = handle; break }
+            timedOut += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        // After timeouts, a normal detach still hands over cleanly.
+        let handle = try early ?? #require(p1.detachForHandover())
+        let second = Recorder()
+        let p2 = LocalProcess(delegate: second)
+        #expect(p2.adopt(handle))
+        await wait(15) { String(decoding: second.bytes.suffix(16), as: UTF8.self).contains("\n300000") }
+        let numbers = (first.text + second.text).split(whereSeparator: { $0.isNewline }).compactMap { Int($0) }
+        #expect(numbers == Array(1...300000), "Anzahl \(numbers.count), Zeitüberschreitungen \(timedOut)")
+        kill(handle.pid, SIGKILL)
+        waitpid(handle.pid, nil, 0)
+    }
+
+    // Review 13.11.2026, Befund 7: the rebuilt read loop under a flood.
+    @Test func floodOfOutputArrivesCompletely() async throws {
+        let rec = Recorder()
+        let p = LocalProcess(delegate: rec)
+        p.startProcess(executable: "/bin/sh", args: ["-c", "/usr/bin/yes | /usr/bin/head -n 2000000"])
+        let deadline = Date().addingTimeInterval(60)
+        while rec.exits.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        // The terminal turns each newline into CR LF; count the lines instead.
+        await wait(60) { rec.bytes.filter { $0 == 0x79 }.count >= 2_000_000 }
+        #expect(rec.bytes.filter { $0 == 0x79 }.count == 2_000_000, "Zeilen \(rec.bytes.filter { $0 == 0x79 }.count)")
+        #expect(rec.bytes.allSatisfy { $0 == 0x79 || $0 == 0x0a || $0 == 0x0d })
+        #expect(rec.exits.count == 1)
+    }
+
     @Test func detachWithoutARunningChildReturnsNil() {
         let p = LocalProcess(delegate: Recorder())
         #expect(p.detachForHandover() == nil)
@@ -221,11 +282,16 @@ final class LocalProcessHandoverTests {
         // A descriptor some library opened without the flag.
         var fds: [Int32] = [0, 0]
         #expect(pipe(&fds) == 0)
-        defer { close(fds[0]); close(fds[1]) }
-        #expect(fcntl(fds[0], F_GETFD) & FD_CLOEXEC == 0)
+        // On a high number: a low one could be handed out again inside the
+        // child (the shell opens files of its own), which would look inherited.
+        let probe = fcntl(fds[0], F_DUPFD, 400)
+        close(fds[0])
+        defer { close(probe); close(fds[1]) }
+        #expect(probe >= 400)
+        #expect(fcntl(probe, F_GETFD) & FD_CLOEXEC == 0)
         let rec = Recorder()
         let p = LocalProcess(delegate: rec)
-        p.startProcess(executable: "/bin/sh", args: ["-c", "if { true <&\(fds[0]); } 2>/dev/null; then echo GEERBT; else echo FREI; fi"])
+        p.startProcess(executable: "/bin/sh", args: ["-c", "if { true <&\(probe); } 2>/dev/null; then echo GEERBT; else echo FREI; fi"])
         await wait { rec.text.contains("GEERBT") || rec.text.contains("FREI") }
         #expect(rec.text.contains("FREI"), "\(rec.text)")
     }

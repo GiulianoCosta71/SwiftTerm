@@ -163,18 +163,21 @@ public class LocalProcess {
     /// read chain on a newer one.
     private func issueRead(on channel: DispatchIO) {
         pendingLock.lock()
-        readInFlight = true
+        readsInFlight += 1
         pendingLock.unlock()
         channel.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
             self?.childProcessRead(channel: channel, done: done, data: data, errno: errno)
         }
     }
 
-    /// Marks the end of a read operation; wakes a waiting `detachForHandover`.
+    /// Marks the end of a read operation; wakes a waiting `detachForHandover`
+    /// once no read is outstanding. A counter, not a flag: after a detach that
+    /// timed out, the late read of the stopped channel and the first read of
+    /// the new one overlap, and the late one must not mark the new one done.
     private func readFinished() {
         pendingLock.lock()
-        readInFlight = false
-        let waiter = isDetaching ? readStopped : nil
+        readsInFlight = max(0, readsInFlight - 1)
+        let waiter = isDetaching && readsInFlight == 0 ? readStopped : nil
         pendingLock.unlock()
         waiter?.signal()
     }
@@ -372,11 +375,12 @@ public class LocalProcess {
             }
         }
         if done {
+            // Successor first, then count this one finished: the counter never
+            // drops to zero between two reads of the same chain.
             if keepReading && isCurrent {
                 issueRead(on: channel)
-            } else {
-                readFinished()
             }
+            readFinished()
         }
     }
 
@@ -390,7 +394,8 @@ public class LocalProcess {
     var isDetaching = false
     var detachedBytes: [UInt8] = []
     /// A read operation is outstanding on the current channel.
-    var readInFlight = false
+    /// Read operations issued and not yet finished (`done`).
+    var readsInFlight = 0
     var readStopped: DispatchSemaphore?
     var adoptedExitReported = false
 
@@ -408,8 +413,11 @@ public class LocalProcess {
         // intentionally don't send SIGTERM here; terminate() remains the
         // explicit API for killing the shell. deinit only guarantees that
         // our own I/O resources don't outlive us.
-        io?.close()
+        pendingLock.lock()
+        let channel = io
         io = nil
+        pendingLock.unlock()
+        channel?.close()
     }
 
     func processTerminated ()
@@ -651,7 +659,7 @@ public class LocalProcess {
         isDetaching = true
         detachedBytes = []
         readStopped = stopped
-        let mustWait = readInFlight
+        let mustWait = readsInFlight > 0
         pendingLock.unlock()
 
         // Stop reading. Wait only for the outstanding read to come back, not
@@ -720,36 +728,43 @@ public class LocalProcess {
         guard !running, handle.fileDescriptor >= 0, handle.pid > 0 else {
             return false
         }
-        _ = fcntl(handle.fileDescriptor, F_SETFD, FD_CLOEXEC)
-        childfd = handle.fileDescriptor
         shellPid = handle.pid
         adoptedExitReported = false
+        // Without a way to learn about the exit, do not take the terminal:
+        // the caller keeps the descriptor and falls back.
+        guard watchAdoptedExit(pid: handle.pid) else {
+            shellPid = 0
+            return false
+        }
+        _ = fcntl(handle.fileDescriptor, F_SETFD, FD_CLOEXEC)
+        childfd = handle.fileDescriptor
         running = true
-        watchAdoptedExit(pid: handle.pid)
         startReading(handle.fileDescriptor)
         return true
     }
 
-    private func watchAdoptedExit(pid: pid_t) {
+    /// Sets up the exit watch. Returns false if it cannot be set up for any
+    /// reason other than the process being gone already; only "no such
+    /// process" counts as ended.
+    private func watchAdoptedExit(pid: pid_t) -> Bool {
         let kq = kqueue()
-        guard kq >= 0 else {
-            reportAdoptedExitIfGone(pid: pid)
-            return
-        }
+        guard kq >= 0 else { return false }
         _ = fcntl(kq, F_SETFD, FD_CLOEXEC)
         // NOTE_EXITSTATUS (0x04000000) asks for the wait status in `data`.
         let noteExitStatus: UInt32 = 0x0400_0000
         var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
                             fflags: UInt32(NOTE_EXIT) | noteExitStatus, data: 0, udata: nil)
         if kevent(kq, &change, 1, nil, 0, nil) != 0 {
+            let error = errno
+            close(kq)
             // ESRCH: no such process, or a zombie waiting to be collected
             // (kill(pid, 0) still succeeds for a zombie). Either way it ended.
-            close(kq)
+            guard error == ESRCH else { return false }
             dispatchQueue.async { [weak self] in
                 guard let self, self.shellPid == pid else { return }
                 self.adoptedProcessTerminated(status: nil)
             }
-            return
+            return true
         }
         let source = DispatchSource.makeReadSource(fileDescriptor: kq, queue: dispatchQueue)
         source.setEventHandler { [weak self] in
@@ -765,16 +780,7 @@ public class LocalProcess {
         source.setCancelHandler { close(kq) }
         adoptedMonitor = source
         source.resume()
-    }
-
-    private func reportAdoptedExitIfGone(pid: pid_t) {
-        if kill(pid, 0) != 0 && errno == ESRCH {
-            dispatchQueue.async { [weak self] in
-                // Not `running`: end-of-file on the terminal may come first.
-                guard let self, self.shellPid == pid else { return }
-                self.adoptedProcessTerminated(status: nil)
-            }
-        }
+        return true
     }
 
     public func terminate()
@@ -794,8 +800,12 @@ public class LocalProcess {
         // The cleanup handler ensures FDs are closed AFTER DispatchIO is done with them,
         // preventing "BUG IN CLIENT OF LIBDISPATCH: Unexpected EV_VANISHED" crash
         // This applies to both Subprocess and forkpty paths
-        io?.close()
+        // `io` is read under the lock by the read loop.
+        pendingLock.lock()
+        let channel = io
         io = nil
+        pendingLock.unlock()
+        channel?.close()
         childfd = -1
 
         if shellPid != 0 {
